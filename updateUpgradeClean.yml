@@ -1,5 +1,5 @@
 ---
-- hosts: all
+- hosts: hosts
   become: true
 
   tasks:
@@ -8,15 +8,3 @@
       update_cache: yes
       only_upgrade: yes
 
-  - name: Enable unattended upgrades
-    command: dpkg-reconfigure -f noninteractive unattended-upgrades
-    creates: /etc/apt/apt.conf.d/20auto-upgrades
-
-  - name: Update all installed packages using YUM
-    yum:
-      update_cache: yes
-      only_upgrade: yes
-
-  - name: Reboot when packages were updated
-    reboot:
-      when: yum_update_status.changed or apt_update_status.changed
