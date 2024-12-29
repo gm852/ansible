@@ -1,0 +1,33 @@
+---
+- name: Automated System Maintenance
+  hosts: all
+  become: true  # Ensures the playbook runs with sudo privileges
+  tasks:
+
+    - name: Update package lists
+      apt:
+        update_cache: yes
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        cache_valid_time: 3600  # Refresh the cache if older than 1 hour
+
+    - name: Remove unnecessary packages
+      apt:
+        autoremove: yes
+
+    - name: Check if a reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Notify if a reboot is required
+      debug:
+        msg: "Reboot is required. Please reboot the system."
+      when: reboot_required.stat.exists
+
+    - name: Notify if no reboot is required
+      debug:
+        msg: "No reboot is required."
+      when: not reboot_required.stat.exists
