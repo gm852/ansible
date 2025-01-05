@@ -17,23 +17,6 @@
         autoremove: yes
         purge: yes
 
-    - name: Check if a reboot is required
-      ansible.builtin.command:
-        cmd: needs-restarting
-      register: reboot_status
-      failed_when: false
-      changed_when: false
-
-    - name: Report reboot status
-      ansible.builtin.debug:
-        msg: "Reboot required"
-      when: reboot_status.stdout != ""
-
-    - name: Report no reboot required
-      ansible.builtin.debug:
-        msg: "No reboot required"
-      when: reboot_status.stdout == ""
-
     - name: Check if reboot required
       stat:
         path: /var/run/reboot-required
