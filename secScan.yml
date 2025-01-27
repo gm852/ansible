@@ -1,0 +1,48 @@
+---
+- name: Run rkhunter and lynis
+  hosts: all
+  become: yes
+  tasks:
+    - name: Run rkhunter check
+      command: rkhunter --check --skip-keypress
+      register: rkhunter_output
+      ignore_errors: yes
+      failed_when: false
+      changed_when: false
+
+    - name: Show rkhunter output
+      debug:
+        msg: "{{ rkhunter_output.stdout }}"
+      when: rkhunter_output.stdout is defined
+      failed_when: false
+      changed_when: false
+
+    - name: Run lynis audit
+      command: lynis audit system
+      register: lynis_output
+      ignore_errors: yes
+      failed_when: false
+      changed_when: false
+
+    - name: Show lynis output
+      debug:
+        msg: "{{ lynis_output.stdout }}"
+      when: lynis_output.stdout is defined
+      failed_when: false
+      changed_when: false
+
+    - name: Store rkhunter output in a log file
+      copy:
+        content: "{{ rkhunter_output.stdout }}"
+        dest: "/tmp/rkhunter_report.txt"
+      when: rkhunter_output.stdout is defined and rkhunter_output.stdout != ""
+      failed_when: false
+      changed_when: false
+
+    - name: Store lynis output in a log file
+      copy:
+        content: "{{ lynis_output.stdout }}"
+        dest: "/tmp/lynis_report.txt"
+      when: lynis_output.stdout is defined and lynis_output.stdout != ""
+      failed_when: false
+      changed_when: false
