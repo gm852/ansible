@@ -3,10 +3,20 @@
   hosts: all
   become: yes
   tasks:
+    - name: Check if rkhunter is installed
+      command: which rkhunter
+      register: rkhunter_check
+      failed_when: rkhunter_check.rc != 0
+      changed_when: false
+
+    - name: Ensure rkhunter is installed
+      fail:
+        msg: "rkhunter is not installed on the system."
+      when: rkhunter_check.rc != 0
+
     - name: Run rkhunter check
       command: rkhunter --check --skip-keypress
       register: rkhunter_output
-      ignore_errors: yes
       failed_when: false
       changed_when: false
 
@@ -14,13 +24,27 @@
       debug:
         msg: "{{ rkhunter_output.stdout }}"
       when: rkhunter_output.stdout is defined
-      failed_when: false
+
+    - name: Store rkhunter output in a log file
+      copy:
+        content: "{{ rkhunter_output.stdout }}"
+        dest: "/tmp/rkhunter_report.txt"
+      when: rkhunter_output.stdout is defined and rkhunter_output.stdout != ""
+
+    - name: Check if lynis is installed
+      command: which lynis
+      register: lynis_check
+      failed_when: lynis_check.rc != 0
       changed_when: false
+
+    - name: Ensure lynis is installed
+      fail:
+        msg: "lynis is not installed on the system."
+      when: lynis_check.rc != 0
 
     - name: Run lynis audit
       command: lynis audit system
       register: lynis_output
-      ignore_errors: yes
       failed_when: false
       changed_when: false
 
@@ -28,21 +52,9 @@
       debug:
         msg: "{{ lynis_output.stdout }}"
       when: lynis_output.stdout is defined
-      failed_when: false
-      changed_when: false
-
-    - name: Store rkhunter output in a log file
-      copy:
-        content: "{{ rkhunter_output.stdout }}"
-        dest: "/tmp/rkhunter_report.txt"
-      when: rkhunter_output.stdout is defined and rkhunter_output.stdout != ""
-      failed_when: false
-      changed_when: false
 
     - name: Store lynis output in a log file
       copy:
         content: "{{ lynis_output.stdout }}"
         dest: "/tmp/lynis_report.txt"
       when: lynis_output.stdout is defined and lynis_output.stdout != ""
-      failed_when: false
-      changed_when: false
