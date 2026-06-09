@@ -2,63 +2,136 @@
 - name: Ensure rkhunter and lynis are installed and run them
   hosts: all
   become: yes
+  vars:
+    rkhunter_report: "/tmp/rkhunter_report.txt"
+    lynis_report: "/tmp/lynis_report.txt"
+    rkhunter_warnings: []
+    lynis_warnings: []
+
   tasks:
-    - name: Check if rkhunter is installed
-      command: which rkhunter
-      register: rkhunter_check
-      failed_when: false
-      changed_when: false
-
-    - name: Install rkhunter if not installed
+    # ────────────────────────────────────────────
+    # INSTALLATION
+    # ────────────────────────────────────────────
+    - name: Install rkhunter and lynis
       apt:
-        name: rkhunter
+        name:
+          - rkhunter
+          - lynis
         state: present
-      when: rkhunter_check.rc != 0
+        update_cache: yes
       tags: install
 
-    - name: Check if lynis is installed
-      command: which lynis
-      register: lynis_check
+    # ────────────────────────────────────────────
+    # RKHUNTER
+    # ────────────────────────────────────────────
+    - name: Update rkhunter database
+      command: rkhunter --update
       failed_when: false
       changed_when: false
-
-    - name: Install lynis if not installed
-      apt:
-        name: lynis
-        state: present
-      when: lynis_check.rc != 0
-      tags: install
 
     - name: Run rkhunter check
-      command: rkhunter --check --skip-keypress
+      command: rkhunter --check --skip-keypress --report-warnings-only
       register: rkhunter_output
       failed_when: false
       changed_when: false
 
-    - name: Show rkhunter output
-      debug:
-        msg: "{{ rkhunter_output.stdout }}"
-      when: rkhunter_output.stdout is defined
-
-    - name: Store rkhunter output in a log file
+    - name: Store rkhunter output in log file
       copy:
-        content: "{{ rkhunter_output.stdout }}"
-        dest: "/tmp/rkhunter_report.txt"
-      when: rkhunter_output.stdout is defined and rkhunter_output.stdout != ""
+        content: "{{ rkhunter_output.stdout | default('') }}\n{{ rkhunter_output.stderr | default('') }}"
+        dest: "{{ rkhunter_report }}"
+      when: rkhunter_output is defined
 
+    - name: Parse rkhunter warnings
+      set_fact:
+        rkhunter_warnings: "{{ rkhunter_output.stdout_lines | select('search', '(?i)(warning|infected|suspicious|rootkit|possible)') | list }}"
+      when: rkhunter_output.stdout_lines is defined
+
+    - name: "🚨 RKHUNTER — THREATS DETECTED 🚨"
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════╗
+          ║         !! RKHUNTER SECURITY ALERT !!           ║
+          ║  Warnings or threats were found on {{ inventory_hostname }}  ║
+          ╚══════════════════════════════════════════════════╝
+
+          FINDINGS:
+          {% for line in rkhunter_warnings %}
+            ⚠️  {{ line }}
+          {% endfor %}
+
+          Full report saved to: {{ rkhunter_report }}
+      when: rkhunter_warnings | length > 0
+
+    - name: Fail run if rkhunter found threats
+      fail:
+        msg: >
+          🚨 CRITICAL: rkhunter detected {{ rkhunter_warnings | length }} warning(s) on {{ inventory_hostname }}.
+          Review the full report at {{ rkhunter_report }}.
+          Findings: {{ rkhunter_warnings | join(' | ') }}
+      when: rkhunter_warnings | length > 0
+
+    # ────────────────────────────────────────────
+    # LYNIS
+    # ────────────────────────────────────────────
     - name: Run lynis audit
-      command: lynis audit system
+      command: lynis audit system --no-colors
       register: lynis_output
       failed_when: false
       changed_when: false
 
-    - name: Show lynis output
-      debug:
-        msg: "{{ lynis_output.stdout }}"
+    - name: Store lynis output in log file
+      copy:
+        content: "{{ lynis_output.stdout | default('') }}\n{{ lynis_output.stderr | default('') }}"
+        dest: "{{ lynis_report }}"
+      when: lynis_output is defined
+
+    - name: Parse lynis warnings and suggestions
+      set_fact:
+        lynis_warnings: "{{ lynis_output.stdout_lines | select('search', '(?i)(warning|danger|critical|\\[!\\])') | list }}"
+      when: lynis_output.stdout_lines is defined
+
+    - name: Extract lynis hardening index
+      set_fact:
+        lynis_hardening_index: >-
+          {{ lynis_output.stdout
+             | regex_search('Hardening index\\s*:\\s*(\\d+)', '\\1')
+             | first | default('unknown') }}
       when: lynis_output.stdout is defined
 
-    - name: Store lynis output in a log file
-      copy:
-        content: "{{ lynis_output.stdout }}"
-        dest: "/tmp/lynis_report.txt"
-      when: lynis_output.stdout is defined and lynis_output.stdout != ""
+    - name: "🚨 LYNIS — THREATS DETECTED 🚨"
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════╗
+          ║           !! LYNIS SECURITY ALERT !!            ║
+          ║  Warnings or threats were found on {{ inventory_hostname }}  ║
+          ╠══════════════════════════════════════════════════╣
+          ║  Hardening Index: {{ lynis_hardening_index }}
+          ╚══════════════════════════════════════════════════╝
+
+          FINDINGS:
+          {% for line in lynis_warnings %}
+            ⚠️  {{ line }}
+          {% endfor %}
+
+          Full report saved to: {{ lynis_report }}
+      when: lynis_warnings | length > 0
+
+    - name: Fail run if lynis found threats
+      fail:
+        msg: >
+          🚨 CRITICAL: Lynis detected {{ lynis_warnings | length }} warning(s) on {{ inventory_hostname }}.
+          Hardening index: {{ lynis_hardening_index | default('unknown') }}.
+          Review the full report at {{ lynis_report }}.
+          Findings: {{ lynis_warnings | join(' | ') }}
+      when: lynis_warnings | length > 0
+
+    # ────────────────────────────────────────────
+    # ALL CLEAR
+    # ────────────────────────────────────────────
+    - name: ✅ Security scan passed — no threats found
+      debug:
+        msg: |
+          ✅ All security scans completed on {{ inventory_hostname }} with no warnings.
+          rkhunter report : {{ rkhunter_report }}
+          lynis report    : {{ lynis_report }}
+          Hardening index : {{ lynis_hardening_index | default('N/A') }}
