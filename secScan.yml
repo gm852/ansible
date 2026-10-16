@@ -1,137 +1,309 @@
 ---
-- name: Ensure rkhunter and lynis are installed and run them
+# ==============================================================================
+# update_machines.yml - Automated OS patching for all managed machines
+#
+# Supports : Debian/Ubuntu (apt) and RHEL/Rocky/Alma/CentOS/Fedora (dnf/yum)
+#
+# Usage:
+#   ansible-playbook -i inventory update_machines.yml
+#   ansible-playbook -i inventory update_machines.yml --check            # dry run
+#   ansible-playbook -i inventory update_machines.yml -l webservers      # subset
+#   ansible-playbook -i inventory update_machines.yml -e update_reboot_allowed=false
+#   ansible-playbook -i inventory update_machines.yml -e update_serial=1
+#   ansible-playbook -i inventory update_machines.yml --tags precheck,update
+#
+# Tags: precheck, update, cleanup, reboot, verify, report
+# ==============================================================================
+
+- name: Update all machines
   hosts: all
-  become: yes
+  become: true
+  gather_facts: true
+
+  # Patch in batches so a bad update can't take down the whole fleet at once.
+  serial: "{{ update_serial | default('25%') }}"
+  max_fail_percentage: 20
+
   vars:
-    rkhunter_report: "/tmp/rkhunter_report.txt"
-    lynis_report: "/tmp/lynis_report.txt"
-    rkhunter_warnings: []
-    lynis_warnings: []
+    # --- Behaviour ---------------------------------------------------------
+    update_reboot_allowed: true          # Reboot automatically when required
+    update_reboot_timeout: 900           # Seconds to wait for a host to return
+    update_reboot_post_delay: 30         # Settle time after reboot (seconds)
+    update_min_free_mb_root: 1024        # Abort if / has less free space (MB)
+    update_package_lock_timeout: 300     # Seconds to wait on apt/dnf locks
+
+    # --- Debian/Ubuntu -------------------------------------------------------
+    update_apt_upgrade_mode: safe        # safe | full | dist
+    update_apt_autoremove: true
+    update_apt_autoclean: true
+    update_apt_held_packages: []         # e.g. ['docker-ce', 'postgresql-15']
+
+    # --- RHEL family -----------------------------------------------------------
+    update_rpm_exclude: []               # e.g. ['kernel*', 'docker-ce*']
+    update_rpm_autoremove: true
+
+    # --- Logging -----------------------------------------------------------------
+    update_log_file: /var/log/ansible-auto-update.log
+
+  pre_tasks:
+    - name: Assert host runs a supported OS family
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] in ['Debian', 'RedHat']
+        fail_msg: >-
+          Unsupported OS family '{{ ansible_facts['os_family'] }}' on
+          {{ inventory_hostname }}. Only Debian and RedHat families are supported.
+        quiet: true
+      tags: [precheck, always]
+
+    - name: Initialise update state
+      ansible.builtin.set_fact:
+        update_reboot_required: false
+        update_failed_units: []
+      tags: always
+
+    - name: Check free space on /
+      ansible.builtin.assert:
+        that:
+          - >-
+            (ansible_facts['mounts']
+              | selectattr('mount', 'equalto', '/')
+              | map(attribute='size_available')
+              | first | default(0)) / 1048576 >= update_min_free_mb_root
+        fail_msg: >-
+          Less than {{ update_min_free_mb_root }} MB free on / for
+          {{ inventory_hostname }}; refusing to update.
+        quiet: true
+      tags: precheck
 
   tasks:
-    # ────────────────────────────────────────────
-    # INSTALLATION
-    # ────────────────────────────────────────────
-    - name: Install rkhunter and lynis
-      apt:
-        name:
-          - rkhunter
-          - lynis
-        state: present
-        update_cache: yes
-      tags: install
+    - name: Run the update workflow
+      block:
+        # ======================================================================
+        # DEBIAN / UBUNTU
+        # ======================================================================
+        - name: Debian family update
+          when: ansible_facts['os_family'] == 'Debian'
+          block:
+            - name: Wait for any running apt/dpkg process to finish
+              ansible.builtin.command: >-
+                fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+                /var/lib/apt/lists/lock
+              register: update_apt_lock
+              changed_when: false
+              failed_when: false
+              until: update_apt_lock.rc != 0
+              retries: "{{ (update_package_lock_timeout | int / 10) | int }}"
+              delay: 10
+              check_mode: false
+              tags: precheck
 
-    # ────────────────────────────────────────────
-    # RKHUNTER
-    # ────────────────────────────────────────────
-    - name: Update rkhunter database
-      command: rkhunter --update
-      failed_when: false
-      changed_when: false
+            - name: Repair any interrupted dpkg state
+              ansible.builtin.command: dpkg --configure -a
+              register: update_dpkg_repair
+              changed_when: update_dpkg_repair.stdout | length > 0
+              when: not ansible_check_mode
+              tags: precheck
 
-    - name: Run rkhunter check
-      command: rkhunter --check --skip-keypress --report-warnings-only
-      register: rkhunter_output
-      failed_when: false
-      changed_when: false
+            - name: Hold selected packages
+              ansible.builtin.dpkg_selections:
+                name: "{{ item }}"
+                selection: hold
+              loop: "{{ update_apt_held_packages }}"
+              tags: update
 
-    - name: Store rkhunter output in log file
-      copy:
-        content: "{{ rkhunter_output.stdout | default('') }}\n{{ rkhunter_output.stderr | default('') }}"
-        dest: "{{ rkhunter_report }}"
-      when: rkhunter_output is defined
+            - name: Update apt cache
+              ansible.builtin.apt:
+                update_cache: true
+                cache_valid_time: 0
+                lock_timeout: "{{ update_package_lock_timeout }}"
+              register: update_apt_cache
+              retries: 3
+              delay: 15
+              until: update_apt_cache is succeeded
+              tags: update
 
-    - name: Parse rkhunter warnings
-      set_fact:
-        rkhunter_warnings: "{{ rkhunter_output.stdout_lines | select('search', '(?i)(warning|infected|suspicious|rootkit|possible)') | list }}"
-      when: rkhunter_output.stdout_lines is defined
+            - name: Upgrade packages ({{ update_apt_upgrade_mode }})
+              ansible.builtin.apt:
+                upgrade: "{{ update_apt_upgrade_mode }}"
+                lock_timeout: "{{ update_package_lock_timeout }}"
+                autoremove: false
+              environment:
+                DEBIAN_FRONTEND: noninteractive
+              register: update_apt_result
+              tags: update
 
-    - name: "🚨 RKHUNTER — THREATS DETECTED 🚨"
-      debug:
-        msg: |
-          ╔══════════════════════════════════════════════════╗
-          ║         !! RKHUNTER SECURITY ALERT !!           ║
-          ║  Warnings or threats were found on {{ inventory_hostname }}  ║
-          ╚══════════════════════════════════════════════════╝
+            - name: Remove unused packages
+              ansible.builtin.apt:
+                autoremove: true
+                purge: false
+                lock_timeout: "{{ update_package_lock_timeout }}"
+              when: update_apt_autoremove | bool
+              tags: cleanup
 
-          FINDINGS:
-          {% for line in rkhunter_warnings %}
-            ⚠️  {{ line }}
-          {% endfor %}
+            - name: Clean obsolete package files
+              ansible.builtin.apt:
+                autoclean: true
+                lock_timeout: "{{ update_package_lock_timeout }}"
+              when: update_apt_autoclean | bool
+              tags: cleanup
 
-          Full report saved to: {{ rkhunter_report }}
-      when: rkhunter_warnings | length > 0
+            - name: Check whether a reboot is required
+              ansible.builtin.stat:
+                path: /var/run/reboot-required
+              register: update_apt_reboot_file
+              tags: reboot
 
-    - name: Fail run if rkhunter found threats
-      fail:
-        msg: >
-          🚨 CRITICAL: rkhunter detected {{ rkhunter_warnings | length }} warning(s) on {{ inventory_hostname }}.
-          Review the full report at {{ rkhunter_report }}.
-          Findings: {{ rkhunter_warnings | join(' | ') }}
-      when: rkhunter_warnings | length > 0
+            - name: Record reboot requirement
+              ansible.builtin.set_fact:
+                update_reboot_required: "{{ update_apt_reboot_file.stat.exists }}"
+              tags: reboot
 
-    # ────────────────────────────────────────────
-    # LYNIS
-    # ────────────────────────────────────────────
-    - name: Run lynis audit
-      command: lynis audit system --no-colors
-      register: lynis_output
-      failed_when: false
-      changed_when: false
+        # ======================================================================
+        # RHEL / ROCKY / ALMA / CENTOS / FEDORA
+        # ======================================================================
+        - name: RedHat family update
+          when: ansible_facts['os_family'] == 'RedHat'
+          block:
+            - name: Ensure needs-restarting is available
+              ansible.builtin.package:
+                name: "{{ 'dnf-utils' if ansible_facts['distribution_major_version'] | int >= 8 else 'yum-utils' }}"
+                state: present
+              when: ansible_facts['distribution'] != 'Fedora'
+              tags: precheck
 
-    - name: Store lynis output in log file
-      copy:
-        content: "{{ lynis_output.stdout | default('') }}\n{{ lynis_output.stderr | default('') }}"
-        dest: "{{ lynis_report }}"
-      when: lynis_output is defined
+            - name: Upgrade all packages
+              ansible.builtin.yum:
+                name: "*"
+                state: latest
+                update_cache: true
+                exclude: "{{ update_rpm_exclude }}"
+                lock_timeout: "{{ update_package_lock_timeout }}"
+              register: update_rpm_result
+              retries: 3
+              delay: 15
+              until: update_rpm_result is succeeded
+              tags: update
 
-    - name: Parse lynis warnings and suggestions
-      set_fact:
-        lynis_warnings: "{{ lynis_output.stdout_lines | select('search', '(?i)(warning|danger|critical|\\[!\\])') | list }}"
-      when: lynis_output.stdout_lines is defined
+            - name: Remove unneeded dependencies
+              ansible.builtin.yum:
+                autoremove: true
+                lock_timeout: "{{ update_package_lock_timeout }}"
+              when: update_rpm_autoremove | bool
+              tags: cleanup
 
-    - name: Extract lynis hardening index
-      set_fact:
-        lynis_hardening_index: >-
-          {{ lynis_output.stdout
-             | regex_search('Hardening index\\s*:\\s*(\\d+)', '\\1')
-             | first | default('unknown') }}
-      when: lynis_output.stdout is defined
+            - name: Check whether a reboot is required
+              ansible.builtin.command: needs-restarting -r
+              register: update_rpm_reboot_check
+              changed_when: false
+              failed_when: update_rpm_reboot_check.rc not in [0, 1]
+              check_mode: false
+              tags: reboot
 
-    - name: "🚨 LYNIS — THREATS DETECTED 🚨"
-      debug:
-        msg: |
-          ╔══════════════════════════════════════════════════╗
-          ║           !! LYNIS SECURITY ALERT !!            ║
-          ║  Warnings or threats were found on {{ inventory_hostname }}  ║
-          ╠══════════════════════════════════════════════════╣
-          ║  Hardening Index: {{ lynis_hardening_index }}
-          ╚══════════════════════════════════════════════════╝
+            - name: Record reboot requirement
+              ansible.builtin.set_fact:
+                update_reboot_required: "{{ update_rpm_reboot_check.rc == 1 }}"
+              tags: reboot
 
-          FINDINGS:
-          {% for line in lynis_warnings %}
-            ⚠️  {{ line }}
-          {% endfor %}
+        # ======================================================================
+        # REBOOT
+        # ======================================================================
+        - name: Reboot host to finish applying updates
+          ansible.builtin.reboot:
+            msg: "Reboot initiated by Ansible auto-update"
+            reboot_timeout: "{{ update_reboot_timeout }}"
+            post_reboot_delay: "{{ update_reboot_post_delay }}"
+            test_command: uptime
+          when:
+            - update_reboot_required | bool
+            - update_reboot_allowed | bool
+            - not ansible_check_mode
+          tags: reboot
 
-          Full report saved to: {{ lynis_report }}
-      when: lynis_warnings | length > 0
+        - name: Warn that a manual reboot is still needed
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }} needs a reboot but automatic reboots
+              are disabled (update_reboot_allowed=false).
+          when:
+            - update_reboot_required | bool
+            - not (update_reboot_allowed | bool)
+          tags: reboot
 
-    - name: Fail run if lynis found threats
-      fail:
-        msg: >
-          🚨 CRITICAL: Lynis detected {{ lynis_warnings | length }} warning(s) on {{ inventory_hostname }}.
-          Hardening index: {{ lynis_hardening_index | default('unknown') }}.
-          Review the full report at {{ lynis_report }}.
-          Findings: {{ lynis_warnings | join(' | ') }}
-      when: lynis_warnings | length > 0
+        # ======================================================================
+        # POST-UPDATE VERIFICATION
+        # ======================================================================
+        - name: List failed systemd units
+          ansible.builtin.command: systemctl --failed --no-legend --plain
+          register: update_failed_units_raw
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          tags: verify
 
-    # ────────────────────────────────────────────
-    # ALL CLEAR
-    # ────────────────────────────────────────────
-    - name: ✅ Security scan passed — no threats found
-      debug:
-        msg: |
-          ✅ All security scans completed on {{ inventory_hostname }} with no warnings.
-          rkhunter report : {{ rkhunter_report }}
-          lynis report    : {{ lynis_report }}
-          Hardening index : {{ lynis_hardening_index | default('N/A') }}
+        - name: Record failed units
+          ansible.builtin.set_fact:
+            update_failed_units: "{{ update_failed_units_raw.stdout_lines | default([]) }}"
+          tags: verify
+
+        - name: Warn about failed systemd units
+          ansible.builtin.debug:
+            msg: |
+              {{ inventory_hostname }} has failed systemd units after updating:
+              {% for unit in update_failed_units %}
+                - {{ unit }}
+              {% endfor %}
+          when: update_failed_units | length > 0
+          tags: verify
+
+        # ======================================================================
+        # LOGGING
+        # ======================================================================
+        - name: Append result to update log
+          ansible.builtin.lineinfile:
+            path: "{{ update_log_file }}"
+            line: >-
+              {{ ansible_date_time.iso8601 }} status=success
+              reboot_required={{ update_reboot_required | bool }}
+              reboot_allowed={{ update_reboot_allowed | bool }}
+              failed_units={{ update_failed_units | length }}
+            create: true
+            mode: "0640"
+            owner: root
+            group: root
+          when: not ansible_check_mode
+          tags: report
+
+      rescue:
+        - name: Append failure to update log
+          ansible.builtin.lineinfile:
+            path: "{{ update_log_file }}"
+            line: >-
+              {{ ansible_date_time.iso8601 }} status=failed
+              task="{{ ansible_failed_task.name | default('unknown') }}"
+            create: true
+            mode: "0640"
+            owner: root
+            group: root
+          failed_when: false
+          when: not ansible_check_mode
+          tags: report
+
+        - name: Fail the host with a clear message
+          ansible.builtin.fail:
+            msg: >-
+              Update failed on {{ inventory_hostname }} at task
+              "{{ ansible_failed_task.name | default('unknown') }}":
+              {{ ansible_failed_result.msg | default('see output above') }}
+          tags: report
+
+  post_tasks:
+    - name: Per-host update summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ ansible_facts['distribution'] }}
+          {{ ansible_facts['distribution_version'] }}): update complete.
+          Reboot needed: {{ update_reboot_required | bool }}.
+          Failed units: {{ update_failed_units | length }}.
+          Log: {{ update_log_file }}
+      tags: report
